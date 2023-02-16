@@ -31,29 +31,38 @@ func SetFrom[E comparable](elems []E) Set[E] {
 	return s
 }
 
+// Copy creates a shallow copy of this set
+func (s Set[E]) Copy() Set[E] {
+	s2 := NewSet[E](s.Len())
+	for elem := range s.Elems {
+		s2.Add(elem)
+	}
+	return s2
+}
+
 // IsZero returns true if this is the zero set
-func (s *Set[E]) IsZero() bool {
+func (s Set[E]) IsZero() bool {
 	return s.Elems == nil
 }
 
 // Add adds an element to the set
-func (s *Set[E]) Add(elem E) {
+func (s Set[E]) Add(elem E) {
 	s.Elems[elem] = struct{}{}
 }
 
 // Remove removes an element from the set
-func (s *Set[E]) Remove(elem E) {
+func (s Set[E]) Remove(elem E) {
 	delete(s.Elems, elem)
 }
 
 // Contains returns true if an element is in the set
-func (s *Set[E]) Contains(elem E) bool {
+func (s Set[E]) Contains(elem E) bool {
 	_, ok := s.Elems[elem]
 	return ok
 }
 
 // Len returns the number of elements in the set
-func (s *Set[E]) Len() int {
+func (s Set[E]) Len() int {
 	return len(s.Elems)
 }
 
@@ -188,6 +197,28 @@ func (e *UndefinedIDError[K]) Error() string {
 	return fmt.Sprintf("Node %v references undefined ID %v", e.Referee, e.Undefined)
 }
 
+// CycleError indicates a cycle was detected
+type CycleError[K comparable] struct {
+	Cycle []K
+}
+
+var _ = error(&CycleError[string]{})
+
+func (e CycleError[K]) Error() string {
+	builder := strings.Builder{}
+	builder.WriteString("Cycle Detected")
+	first := true
+	for _, k := range e.Cycle {
+		if first {
+			first = false
+		} else {
+			builder.WriteString(" -> ")
+		}
+		builder.WriteString(fmt.Sprintf("%v", k))
+	}
+	return builder.String()
+}
+
 // RunError collects all of the errors encountered while running a DAG
 type RunError[K comparable] struct {
 	Errors map[K]error
@@ -220,26 +251,82 @@ var errStopAt = errors.New("StopAt")
 
 // Run executes the nodes of a DAG concurrency according to the provided options
 func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
-	// TODO: Detect cycle
 	finished := NewSet[K](d.Len())
 	failed := make(map[K]error, d.Len())
 	waiting := NewSet[K](d.Len())
 	running := NewSet[K](d.Len())
-	var sem Semaphore
-	sem = NewSemaphore(opts.MaxInFlight)
-	if !opts.StartFrom.IsZero() {
-		for id := range opts.StartFrom.Elems {
-			waiting.Add(id)
+	ancestors := make(map[K]Set[K], d.Len())
+	descendents := make(map[K]Set[K], d.Len())
+
+	// Build the inital state
+	// StartFrom and their decendents should be waiting if specified, else all nodes should be waiting
+	// StopAt nodes should preemptively "fail" with a sentinel error to prevent any decendents from running
+	// Skip nodes should be finished with no error
+	for id, node := range d.Nodes {
+		ancestors[id] = node.GetDependencies().Copy()
+	}
+	var traverse func(seen Set[K], currentSeen Set[K], order []K, next K) error
+	traverse = func(seen Set[K], currentSeen Set[K], order []K, next K) error {
+		if currentSeen.Contains(next) {
+			order = append(order, next)
+			return CycleError[K]{Cycle: order}
 		}
-	} else {
+		seen.Add(next)
+		currentSeen.Add(next)
+		order = append(order, next)
+		defer func() {
+			order = order[:len(order)-1]
+			currentSeen.Remove(next)
+		}()
+		for dep := range d.Nodes[next].GetDependencies().Elems {
+			if _, ok := d.Nodes[dep]; !ok {
+				return &UndefinedIDError[K]{Referee: next, Undefined: dep}
+			}
+			err := traverse(seen, currentSeen, order, dep)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for id := range d.Nodes {
+		ancestors[id] = NewSet[K](d.Len())
+		currentSeen := NewSet[K](d.Len())
+		order := make([]K, 0, d.Len())
+		err := traverse(ancestors[id], currentSeen, order, id)
+		if err != nil {
+			return err
+		}
+		ancestors[id].Remove(id)
+	}
+	// Can we do better than n^2?
+	for id := range d.Nodes {
+		descendents[id] = NewSet[K](d.Len())
+		for id2 := range d.Nodes {
+			if ancestors[id2].Contains(id) {
+				descendents[id].Add(id2)
+			}
+		}
+	}
+	sem := NewSemaphore(opts.MaxInFlight)
+	if opts.StartFrom.IsZero() {
 		for id := range d.Nodes {
 			waiting.Add(id)
 		}
-	}
-	for id, node := range d.Nodes {
-		for dependency := range node.GetDependencies().Elems {
-			if _, ok := d.Nodes[dependency]; !ok {
-				return &UndefinedIDError[K]{Referee: id, Undefined: dependency}
+	} else {
+		for id := range opts.StartFrom.Elems {
+			if _, ok := d.Nodes[id]; !ok {
+				// TODO: Should this be an error?
+				continue
+			}
+			waiting.Add(id)
+			for descendent := range descendents[id].Elems {
+				waiting.Add(descendent)
+			}
+		}
+		for id := range d.Nodes {
+			if !waiting.Contains(id) {
+				finished.Add(id)
 			}
 		}
 	}
@@ -251,6 +338,17 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 		failed[id] = errStopAt
 	}
 	nodeEvents := make(chan nodeEvent[K])
+
+	// fmt.Println(ancestors)
+	// fmt.Println(descendents)
+	// fmt.Println(waiting)
+	// fmt.Println(finished)
+	// fmt.Println(failed)
+
+	// Each time a task finishes,
+	// search for any nodes where all dependencies are finished and not failed,
+	// and start then start their task in a goroutine that reports success or failure,
+	// as well as handles panics
 	executeReadyNodes := func() bool {
 		anyStarted := false
 	nodes:
@@ -300,7 +398,13 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 		return anyStarted
 	}
 
-	executeReadyNodes()
+	// Start by running any initially available nodes
+	// if no nodes can run, then there is nothing left to do
+	if !executeReadyNodes() {
+		return nil
+	}
+	// Otherwise, wait for those nodes to finish and synchronously search for
+	// other nodes that can now run, and repeat
 	for event := range nodeEvents {
 		node := d.Nodes[event.id]
 		running.Remove(event.id)
@@ -319,13 +423,15 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 			e.OnComplete(event.id, node, event.err)
 		}
 		anyStarted := executeReadyNodes()
-		// We are done when either:
-		// A. All nodes succeed, there are no more nodes running or waiting
-		// B. No more nodes can run, all remaining waiting nodes have failed transitive dependencies
-		if (!anyStarted && running.Len() == 0) || (running.Len() == 0 && waiting.Len() == 0) {
+		allFinished := running.Len() == 0 && waiting.Len() == 0
+		noMoreCanRun := !anyStarted && running.Len() == 0
+		if allFinished || noMoreCanRun {
 			close(nodeEvents)
 		}
 	}
+
+	// Remove any StopAt sentinel errors, since those shouldn't be reported to the caller.
+	// If that node actually failed, it will have been overwritten
 	for id, err := range failed {
 		if err == errStopAt {
 			delete(failed, id)
