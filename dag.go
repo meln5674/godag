@@ -238,7 +238,7 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 	}
 	for id, node := range d.Nodes {
 		for dependency := range node.GetDependencies().Elems {
-			if !waiting.Contains(dependency) {
+			if _, ok := d.Nodes[dependency]; !ok {
 				return &UndefinedIDError[K]{Referee: id, Undefined: dependency}
 			}
 		}
