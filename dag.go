@@ -3,6 +3,7 @@ package godag
 import (
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strings"
 )
 
@@ -168,8 +169,9 @@ type Executor[K comparable, E Node[K]] struct {
 	OnStart func(K, E)
 	// OnSuccess is called after a node succeeds
 	OnSuccess func(K, E)
-	// OnFailure is called after a node fails
-	OnFailure func(K, E, error)
+	// OnFailure is called after a node fails.
+	// The returned error will be the error that is included in the final error set.
+	OnFailure func(K, E, error) error
 	// OnComplete is called after node succeeds or fails, after OnSuccess and OnFailure
 	OnComplete func(K, E, error)
 }
@@ -195,6 +197,17 @@ var _ = error(&UndefinedIDError[string]{})
 
 func (e *UndefinedIDError[K]) Error() string {
 	return fmt.Sprintf("Node %v references undefined ID %v", e.Referee, e.Undefined)
+}
+
+type DAGPanic struct {
+	Recovered interface{}
+	Stack     []byte
+}
+
+var _ = error(&DAGPanic{})
+
+func (e *DAGPanic) Error() string {
+	return fmt.Sprintf("A DAG Task panicked: %v\n%s", e.Recovered, string(e.Stack))
 }
 
 // CycleError indicates a cycle was detected
@@ -339,11 +352,11 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 	}
 	nodeEvents := make(chan nodeEvent[K])
 
-	// fmt.Println(ancestors)
-	// fmt.Println(descendents)
-	// fmt.Println(waiting)
-	// fmt.Println(finished)
-	// fmt.Println(failed)
+	fmt.Println(ancestors)
+	fmt.Println(descendents)
+	fmt.Println(waiting)
+	fmt.Println(finished)
+	fmt.Println(failed)
 
 	// Each time a task finishes,
 	// search for any nodes where all dependencies are finished and not failed,
@@ -381,10 +394,7 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 						if r == nil {
 							return
 						}
-						err = r.(error)
-						if err == nil {
-							err = fmt.Errorf("panic: %v", r)
-						}
+						err = &DAGPanic{Recovered: r, Stack: debug.Stack()}
 					}()
 					err = node.DoDAGTask()
 				}()
