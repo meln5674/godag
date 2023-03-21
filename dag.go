@@ -1,6 +1,7 @@
 package godag
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"runtime/debug"
@@ -96,9 +97,9 @@ func (s Semaphore) Dec() {
 }
 
 // A Node is something that can be executed as a node of a DAG and identified as such
-type Node[K comparable] interface {
-	// DoDAGTask does this node of the dag, potentially failing
-	DoDAGTask() error
+type Node[K comparable, E any] interface {
+	// DoDAGTask does this node of the dag. Nodes can fail, as well as produce additional new nodes, dynamically.
+	DoDAGTask() ([]E, error)
 	// GetID returns some unique identifier for this node
 	GetID() K
 	// GetDependencies returns IDs of nodes with edges incoming to this node, that is,
@@ -108,12 +109,12 @@ type Node[K comparable] interface {
 
 // A DAG is a directect acylcic graph of nodes which perform work
 // and may depend on other nodes to complete successfully first
-type DAG[K comparable, E Node[K]] struct {
+type DAG[K comparable, E Node[K, E]] struct {
 	Nodes map[K]E
 }
 
 // Build builds a dag from a slice of nodes, failing if any return a duplicate ID
-func Build[K comparable, E Node[K]](elems []E) (DAG[K, E], error) {
+func Build[K comparable, E Node[K, E]](elems []E) (DAG[K, E], error) {
 	d := DAG[K, E]{
 		Nodes: make(map[K]E, len(elems)),
 	}
@@ -129,7 +130,7 @@ func Build[K comparable, E Node[K]](elems []E) (DAG[K, E], error) {
 
 // BuildFunc builds a dag from a slice of nodes after mapping them with a provided function,
 // failing if any mapped nodes return a duplicate ID
-func BuildFunc[K comparable, E1 any, E2 Node[K]](elems []E1, f func(*E1) E2) (DAG[K, E2], error) {
+func BuildFunc[K comparable, E1 any, E2 Node[K, E2]](elems []E1, f func(*E1) E2) (DAG[K, E2], error) {
 	d := DAG[K, E2]{
 		Nodes: make(map[K]E2, len(elems)),
 	}
@@ -164,7 +165,7 @@ type Options[K comparable] struct {
 }
 
 // An Executor can execute DAGs
-type Executor[K comparable, E Node[K]] struct {
+type Executor[K comparable, E Node[K, E]] struct {
 	// OnStart is called just before a node is executed
 	OnStart func(K, E)
 	// OnSuccess is called after a node succeeds
@@ -255,27 +256,35 @@ func (e *RunError[K]) Error() string {
 	return builder.String()
 }
 
-type nodeEvent[K any] struct {
-	id  K
-	err error
+type nodeEvent[K comparable, E Node[K, E]] struct {
+	id       K
+	newNodes []E
+	err      error
 }
 
 var errStopAt = errors.New("StopAt")
 
 // Run executes the nodes of a DAG concurrency according to the provided options
-func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
-	finished := NewSet[K](d.Len())
-	failed := make(map[K]error, d.Len())
-	waiting := NewSet[K](d.Len())
-	running := NewSet[K](d.Len())
-	ancestors := make(map[K]Set[K], d.Len())
-	descendents := make(map[K]Set[K], d.Len())
+func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) error {
+	effectiveDAG := DAG[K, E]{
+		Nodes: make(map[K]E, len(d.Nodes)),
+	}
+	for k, e := range d.Nodes {
+		effectiveDAG.Nodes[k] = e
+	}
+
+	finished := NewSet[K](effectiveDAG.Len())
+	failed := make(map[K]error, effectiveDAG.Len())
+	waiting := NewSet[K](effectiveDAG.Len())
+	running := NewSet[K](effectiveDAG.Len())
+	ancestors := make(map[K]Set[K], effectiveDAG.Len())
+	descendents := make(map[K]Set[K], effectiveDAG.Len())
 
 	// Build the inital state
 	// StartFrom and their decendents should be waiting if specified, else all nodes should be waiting
 	// StopAt nodes should preemptively "fail" with a sentinel error to prevent any decendents from running
 	// Skip nodes should be finished with no error
-	for id, node := range d.Nodes {
+	for id, node := range effectiveDAG.Nodes {
 		ancestors[id] = node.GetDependencies().Copy()
 	}
 	var traverse func(seen Set[K], currentSeen Set[K], order []K, next K) error
@@ -291,8 +300,8 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 			order = order[:len(order)-1]
 			currentSeen.Remove(next)
 		}()
-		for dep := range d.Nodes[next].GetDependencies().Elems {
-			if _, ok := d.Nodes[dep]; !ok {
+		for dep := range effectiveDAG.Nodes[next].GetDependencies().Elems {
+			if _, ok := effectiveDAG.Nodes[dep]; !ok {
 				return &UndefinedIDError[K]{Referee: next, Undefined: dep}
 			}
 			err := traverse(seen, currentSeen, order, dep)
@@ -302,10 +311,10 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 		}
 		return nil
 	}
-	for id := range d.Nodes {
-		ancestors[id] = NewSet[K](d.Len())
-		currentSeen := NewSet[K](d.Len())
-		order := make([]K, 0, d.Len())
+	for id := range effectiveDAG.Nodes {
+		ancestors[id] = NewSet[K](effectiveDAG.Len())
+		currentSeen := NewSet[K](effectiveDAG.Len())
+		order := make([]K, 0, effectiveDAG.Len())
 		err := traverse(ancestors[id], currentSeen, order, id)
 		if err != nil {
 			return err
@@ -313,9 +322,9 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 		ancestors[id].Remove(id)
 	}
 	// Can we do better than n^2?
-	for id := range d.Nodes {
-		descendents[id] = NewSet[K](d.Len())
-		for id2 := range d.Nodes {
+	for id := range effectiveDAG.Nodes {
+		descendents[id] = NewSet[K](effectiveDAG.Len())
+		for id2 := range effectiveDAG.Nodes {
 			if ancestors[id2].Contains(id) {
 				descendents[id].Add(id2)
 			}
@@ -323,12 +332,12 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 	}
 	sem := NewSemaphore(opts.MaxInFlight)
 	if opts.StartFrom.IsZero() {
-		for id := range d.Nodes {
+		for id := range effectiveDAG.Nodes {
 			waiting.Add(id)
 		}
 	} else {
 		for id := range opts.StartFrom.Elems {
-			if _, ok := d.Nodes[id]; !ok {
+			if _, ok := effectiveDAG.Nodes[id]; !ok {
 				// TODO: Should this be an error?
 				continue
 			}
@@ -337,7 +346,7 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 				waiting.Add(descendent)
 			}
 		}
-		for id := range d.Nodes {
+		for id := range effectiveDAG.Nodes {
 			if !waiting.Contains(id) {
 				finished.Add(id)
 			}
@@ -350,7 +359,7 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 	for id := range opts.StopAt.Elems {
 		failed[id] = errStopAt
 	}
-	nodeEvents := make(chan nodeEvent[K])
+	nodeEvents := make(chan nodeEvent[K, E])
 
 	fmt.Println(ancestors)
 	fmt.Println(descendents)
@@ -366,7 +375,7 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 		anyStarted := false
 	nodes:
 		for id := range waiting.Elems {
-			node := d.Nodes[id]
+			node := effectiveDAG.Nodes[id]
 			if !opts.Skip.IsZero() && opts.Skip.Contains(id) {
 				continue nodes
 			}
@@ -387,6 +396,7 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 			go func(id K, node E) {
 				sem.Inc()
 				var err error
+				var newNodes []E
 				func() {
 					defer func() {
 						sem.Dec()
@@ -396,11 +406,12 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 						}
 						err = &DAGPanic{Recovered: r, Stack: debug.Stack()}
 					}()
-					err = node.DoDAGTask()
+					newNodes, err = node.DoDAGTask()
 				}()
-				nodeEvents <- nodeEvent[K]{
-					id:  id,
-					err: err,
+				nodeEvents <- nodeEvent[K, E]{
+					id:       id,
+					err:      err,
+					newNodes: newNodes,
 				}
 			}(id, node)
 			anyStarted = true
@@ -415,28 +426,48 @@ func (e Executor[K, E]) Run(d DAG[K, E], opts Options[K]) error {
 	}
 	// Otherwise, wait for those nodes to finish and synchronously search for
 	// other nodes that can now run, and repeat
-	for event := range nodeEvents {
-		node := d.Nodes[event.id]
-		running.Remove(event.id)
-		if event.err == nil {
-			finished.Add(event.id)
-			if e.OnSuccess != nil {
-				e.OnSuccess(event.id, node)
+events:
+	for {
+		select {
+		case event, ok := <-nodeEvents:
+			if !ok {
+				break events
 			}
-		} else {
-			failed[event.id] = event.err
-			if e.OnFailure != nil {
-				e.OnFailure(event.id, node, event.err)
+			node := effectiveDAG.Nodes[event.id]
+			running.Remove(event.id)
+
+			for _, newNode := range event.newNodes {
+				k := newNode.GetID()
+				if _, ok := effectiveDAG.Nodes[k]; ok {
+					event.err = fmt.Errorf("Dynamic node %#v conflicts with ID of existing node", k)
+					break
+				}
+				effectiveDAG.Nodes[k] = newNode
+				waiting.Add(k)
 			}
-		}
-		if e.OnComplete != nil {
-			e.OnComplete(event.id, node, event.err)
-		}
-		anyStarted := executeReadyNodes()
-		allFinished := running.Len() == 0 && waiting.Len() == 0
-		noMoreCanRun := !anyStarted && running.Len() == 0
-		if allFinished || noMoreCanRun {
-			close(nodeEvents)
+
+			if event.err == nil {
+				finished.Add(event.id)
+				if e.OnSuccess != nil {
+					e.OnSuccess(event.id, node)
+				}
+			} else {
+				failed[event.id] = event.err
+				if e.OnFailure != nil {
+					e.OnFailure(event.id, node, event.err)
+				}
+			}
+			if e.OnComplete != nil {
+				e.OnComplete(event.id, node, event.err)
+			}
+			anyStarted := executeReadyNodes()
+			allFinished := running.Len() == 0 && waiting.Len() == 0
+			noMoreCanRun := !anyStarted && running.Len() == 0
+			if allFinished || noMoreCanRun {
+				close(nodeEvents)
+			}
+		case <-ctx.Done():
+			return context.Canceled
 		}
 	}
 
