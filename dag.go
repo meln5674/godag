@@ -107,10 +107,53 @@ type Node[K comparable, E any] interface {
 	GetDependencies() Set[K]
 }
 
+// NodeWithDependencies wraps a Node with an overridden set of dependencies
+// NodeWithDependencies does nto support implementations of Node where DoDAGTask returns new dynamic nodes
+type NodeWithDependencies[K comparable, E any] struct {
+	Node[K, E]
+	DependenciesOverride Set[K]
+}
+
+func (n NodeWithDependencies[K, E]) DoDAGTask() ([]NodeWithDependencies[K, E], error) {
+	newNodes, err := n.Node.DoDAGTask()
+	if err != nil {
+		return nil, err
+	}
+	if len(newNodes) != 0 {
+		return nil, fmt.Errorf("Reversing a dynamic DAG is not yet supported, DAG.Reversed() can only be used with DAGs which do not return new nodes from DoDAGTask")
+	}
+	return nil, nil
+}
+
+func (n NodeWithDependencies[K, E]) GetID() K {
+	return n.Node.GetID()
+}
+
+func (n NodeWithDependencies[K, E]) GetDependencies() Set[K] {
+	return n.DependenciesOverride
+}
+
 // A DAG is a directect acylcic graph of nodes which perform work
 // and may depend on other nodes to complete successfully first
 type DAG[K comparable, E Node[K, E]] struct {
 	Nodes map[K]E
+}
+
+// Reverse returns a new DAG with the same nodes, but with the direction of dependencies reversed
+func Reverse[K comparable, E Node[K, E]](d DAG[K, E]) DAG[K, NodeWithDependencies[K, E]] {
+	d2 := DAG[K, NodeWithDependencies[K, E]]{Nodes: make(map[K]NodeWithDependencies[K, E], len(d.Nodes))}
+
+	for k, v := range d.Nodes {
+		d2.Nodes[k] = NodeWithDependencies[K, E]{Node: v, DependenciesOverride: NewSet[K]()}
+	}
+	for k, v := range d.Nodes {
+		for dep := range v.GetDependencies().Elems {
+			antinode := d2.Nodes[dep]
+			antinode.DependenciesOverride.Add(k)
+		}
+	}
+
+	return d2
 }
 
 // Build builds a dag from a slice of nodes, failing if any return a duplicate ID
@@ -302,6 +345,7 @@ func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) e
 		}()
 		for dep := range effectiveDAG.Nodes[next].GetDependencies().Elems {
 			if _, ok := effectiveDAG.Nodes[dep]; !ok {
+				fmt.Printf("\nEffective DAG at error: %v\n", effectiveDAG)
 				return &UndefinedIDError[K]{Referee: next, Undefined: dep}
 			}
 			err := traverse(seen, currentSeen, order, dep)
@@ -366,6 +410,7 @@ func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) e
 	fmt.Println(waiting)
 	fmt.Println(finished)
 	fmt.Println(failed)
+	fmt.Println(effectiveDAG)
 
 	// Each time a task finishes,
 	// search for any nodes where all dependencies are finished and not failed,
