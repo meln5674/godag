@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"runtime/debug"
 	"strings"
+
+	"github.com/go-logr/logr"
 )
 
 // A Set is a unordered collection of unique elements
@@ -209,6 +211,7 @@ type Options[K comparable] struct {
 
 // An Executor can execute DAGs
 type Executor[K comparable, E Node[K, E]] struct {
+	Log logr.Logger
 	// OnStart is called just before a node is executed
 	OnStart func(K, E)
 	// OnSuccess is called after a node succeeds
@@ -345,8 +348,9 @@ func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) e
 		}()
 		for dep := range effectiveDAG.Nodes[next].GetDependencies().Elems {
 			if _, ok := effectiveDAG.Nodes[dep]; !ok {
-				fmt.Printf("\nEffective DAG at error: %v\n", effectiveDAG)
-				return &UndefinedIDError[K]{Referee: next, Undefined: dep}
+				err := &UndefinedIDError[K]{Referee: next, Undefined: dep}
+				e.Log.V(10).Info("Effective DAG at error", "error", err, "effectiveDAG", effectiveDAG)
+				return err
 			}
 			err := traverse(seen, currentSeen, order, dep)
 			if err != nil {
@@ -405,12 +409,7 @@ func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) e
 	}
 	nodeEvents := make(chan nodeEvent[K, E])
 
-	fmt.Println(ancestors)
-	fmt.Println(descendents)
-	fmt.Println(waiting)
-	fmt.Println(finished)
-	fmt.Println(failed)
-	fmt.Println(effectiveDAG)
+	e.Log.V(10).Info("DAG About to Run", "ancestors", ancestors, "descendents", descendents, "waiting", waiting, "finished", finished, "failed", failed, "effectiveDAG", effectiveDAG)
 
 	// Each time a task finishes,
 	// search for any nodes where all dependencies are finished and not failed,
