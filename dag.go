@@ -349,7 +349,7 @@ func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) e
 		for dep := range effectiveDAG.Nodes[next].GetDependencies().Elems {
 			if _, ok := effectiveDAG.Nodes[dep]; !ok {
 				err := &UndefinedIDError[K]{Referee: next, Undefined: dep}
-				e.Log.V(10).Info("Effective DAG at error", "error", err, "effectiveDAG", effectiveDAG)
+				e.Log.V(5).Info("Effective DAG at error", "error", err, "effectiveDAG", effectiveDAG)
 				return err
 			}
 			err := traverse(seen, currentSeen, order, dep)
@@ -421,17 +421,21 @@ func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) e
 		for id := range waiting.Elems {
 			node := effectiveDAG.Nodes[id]
 			if !opts.Skip.IsZero() && opts.Skip.Contains(id) {
+				e.Log.V(10).Info("Node skipped by user, ignoring", "id", id)
 				continue nodes
 			}
 			if !opts.StopAt.IsZero() && opts.StopAt.Contains(id) {
+				e.Log.V(10).Info("Node marked as stopping point by user, ignoring", "id", id)
 				continue nodes
 			}
 			for dependency := range node.GetDependencies().Elems {
 				if !finished.Contains(dependency) {
+					e.Log.V(10).Info("Node has unfinished dependency, ignoring", "id", id, "dep", dependency)
 					continue nodes
 				}
 
 			}
+			e.Log.V(2).Info("About to start node", "id", id)
 			waiting.Remove(id)
 			running.Add(id)
 			if e.OnStart != nil {
@@ -466,15 +470,18 @@ func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) e
 	// Start by running any initially available nodes
 	// if no nodes can run, then there is nothing left to do
 	if !executeReadyNodes() {
+		e.Log.V(1).Info("No nodes could start, not entering main loop")
 		return nil
 	}
 	// Otherwise, wait for those nodes to finish and synchronously search for
 	// other nodes that can now run, and repeat
+	e.Log.V(10).Info("Initial nodes started, entering main loop")
 events:
 	for {
 		select {
 		case event, ok := <-nodeEvents:
 			if !ok {
+				e.Log.V(5).Info("Node event channel closed")
 				break events
 			}
 			node := effectiveDAG.Nodes[event.id]
@@ -491,11 +498,13 @@ events:
 			}
 
 			if event.err == nil {
+				e.Log.V(1).Info("Node succeded", "id", event.id)
 				finished.Add(event.id)
 				if e.OnSuccess != nil {
 					e.OnSuccess(event.id, node)
 				}
 			} else {
+				e.Log.V(1).Info("Node failed", "id", event.id, "error", event.err)
 				failed[event.id] = event.err
 				if e.OnFailure != nil {
 					e.OnFailure(event.id, node, event.err)
@@ -506,14 +515,23 @@ events:
 			}
 			anyStarted := executeReadyNodes()
 			allFinished := running.Len() == 0 && waiting.Len() == 0
+			if allFinished {
+				e.Log.V(1).Info("No nodes running or waiting to start, graph is finished")
+			}
 			noMoreCanRun := !anyStarted && running.Len() == 0
+			if noMoreCanRun {
+				e.Log.V(1).Info("No nodes could be started, no nodes are running, graph is finished", "waiting", waiting.Elems)
+			}
 			if allFinished || noMoreCanRun {
 				close(nodeEvents)
 			}
 		case <-ctx.Done():
+			e.Log.V(10).Info("DAG Context canceled")
 			return context.Canceled
 		}
 	}
+
+	e.Log.V(10).Info("DAG main loop exited, processing results", "failed", failed)
 
 	// Remove any StopAt sentinel errors, since those shouldn't be reported to the caller.
 	// If that node actually failed, it will have been overwritten
