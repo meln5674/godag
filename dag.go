@@ -435,7 +435,7 @@ func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) e
 				}
 
 			}
-			e.Log.V(2).Info("About to start node", "id", id)
+			e.Log.V(10).Info("About to start node", "id", id)
 			waiting.Remove(id)
 			running.Add(id)
 			if e.OnStart != nil {
@@ -470,7 +470,7 @@ func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) e
 	// Start by running any initially available nodes
 	// if no nodes can run, then there is nothing left to do
 	if !executeReadyNodes() {
-		e.Log.V(1).Info("No nodes could start, not entering main loop")
+		e.Log.V(10).Info("No nodes could start, not entering main loop")
 		return nil
 	}
 	// Otherwise, wait for those nodes to finish and synchronously search for
@@ -481,7 +481,7 @@ events:
 		select {
 		case event, ok := <-nodeEvents:
 			if !ok {
-				e.Log.V(5).Info("Node event channel closed")
+				e.Log.V(10).Info("Node event channel closed")
 				break events
 			}
 			node := effectiveDAG.Nodes[event.id]
@@ -498,13 +498,13 @@ events:
 			}
 
 			if event.err == nil {
-				e.Log.V(1).Info("Node succeded", "id", event.id)
+				e.Log.V(10).Info("Node succeded", "id", event.id)
 				finished.Add(event.id)
 				if e.OnSuccess != nil {
 					e.OnSuccess(event.id, node)
 				}
 			} else {
-				e.Log.V(1).Info("Node failed", "id", event.id, "error", event.err)
+				e.Log.V(5).Info("Node failed", "id", event.id, "error", event.err)
 				failed[event.id] = event.err
 				if e.OnFailure != nil {
 					e.OnFailure(event.id, node, event.err)
@@ -516,11 +516,11 @@ events:
 			anyStarted := executeReadyNodes()
 			allFinished := running.Len() == 0 && waiting.Len() == 0
 			if allFinished {
-				e.Log.V(1).Info("No nodes running or waiting to start, graph is finished")
+				e.Log.V(3).Info("No nodes running or waiting to start, graph is finished")
 			}
 			noMoreCanRun := !anyStarted && running.Len() == 0
 			if noMoreCanRun {
-				e.Log.V(1).Info("No nodes could be started, no nodes are running, graph is finished", "waiting", waiting.Elems)
+				e.Log.V(3).Info("No nodes could be started, no nodes are running, graph is finished", "waiting", waiting.Elems)
 			}
 			if allFinished || noMoreCanRun {
 				close(nodeEvents)
