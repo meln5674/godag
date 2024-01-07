@@ -150,7 +150,13 @@ func Reverse[K comparable, E Node[K, E]](d DAG[K, E]) DAG[K, NodeWithDependencie
 	}
 	for k, v := range d.Nodes {
 		for dep := range v.GetDependencies().Elems {
-			antinode := d2.Nodes[dep]
+			antinode, ok := d2.Nodes[dep]
+			if !ok {
+				panic(UndefinedIDError[K]{
+					Undefined: dep,
+					Referee:   k,
+				})
+			}
 			antinode.DependenciesOverride.Add(k)
 		}
 	}
