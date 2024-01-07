@@ -109,11 +109,26 @@ type Node[K comparable, E any] interface {
 	GetDependencies() Set[K]
 }
 
+type DescriptiveNode interface {
+	// GetDescription is an optional method for Node's to implement to provide a description of the node to
+	// be used in logs and error messages
+	GetDescription() string
+}
+
+func getDescription(node interface{}) string {
+	d, ok := node.(DescriptiveNode)
+	if !ok {
+		return ""
+	}
+	return d.GetDescription()
+}
+
 // NodeWithDependencies wraps a Node with an overridden set of dependencies
 // NodeWithDependencies does nto support implementations of Node where DoDAGTask returns new dynamic nodes
 type NodeWithDependencies[K comparable, E any] struct {
 	Node[K, E]
 	DependenciesOverride Set[K]
+	Description          string
 }
 
 func (n NodeWithDependencies[K, E]) DoDAGTask() ([]NodeWithDependencies[K, E], error) {
@@ -131,6 +146,10 @@ func (n NodeWithDependencies[K, E]) GetID() K {
 	return n.Node.GetID()
 }
 
+func (n NodeWithDependencies[K, E]) GetDescription() string {
+	return n.Description
+}
+
 func (n NodeWithDependencies[K, E]) GetDependencies() Set[K] {
 	return n.DependenciesOverride
 }
@@ -146,7 +165,7 @@ func Reverse[K comparable, E Node[K, E]](d DAG[K, E]) DAG[K, NodeWithDependencie
 	d2 := DAG[K, NodeWithDependencies[K, E]]{Nodes: make(map[K]NodeWithDependencies[K, E], len(d.Nodes))}
 
 	for k, v := range d.Nodes {
-		d2.Nodes[k] = NodeWithDependencies[K, E]{Node: v, DependenciesOverride: NewSet[K]()}
+		d2.Nodes[k] = NodeWithDependencies[K, E]{Node: v, DependenciesOverride: NewSet[K](), Description: getDescription(v)}
 	}
 	for k, v := range d.Nodes {
 		for dep := range v.GetDependencies().Elems {
@@ -265,7 +284,8 @@ func (e *DAGPanic) Error() string {
 
 // CycleError indicates a cycle was detected
 type CycleError[K comparable] struct {
-	Cycle []K
+	Cycle             []K
+	CycleDescriptions []string
 }
 
 var _ = error(&CycleError[string]{})
@@ -274,20 +294,22 @@ func (e CycleError[K]) Error() string {
 	builder := strings.Builder{}
 	builder.WriteString("Cycle Detected")
 	first := true
-	for _, k := range e.Cycle {
+	for ix, k := range e.Cycle {
+		desc := e.CycleDescriptions[ix]
 		if first {
 			first = false
 		} else {
 			builder.WriteString(" -> ")
 		}
-		builder.WriteString(fmt.Sprintf("%v", k))
+		builder.WriteString(fmt.Sprintf("%s (%v)", desc, k))
 	}
 	return builder.String()
 }
 
 // RunError collects all of the errors encountered while running a DAG
 type RunError[K comparable] struct {
-	Errors map[K]error
+	Errors       map[K]error
+	Descriptions map[K]string
 }
 
 var _ = error(&RunError[string]{})
@@ -296,12 +318,13 @@ func (e *RunError[K]) Error() string {
 	builder := strings.Builder{}
 	first := true
 	for k, err := range e.Errors {
+		desc := e.Descriptions[k]
 		if first {
 			first = false
 		} else {
 			builder.WriteString(", ")
 		}
-		builder.WriteString(fmt.Sprintf("%v", k))
+		builder.WriteString(fmt.Sprintf("%s (%v)", desc, k))
 		builder.WriteString(": ")
 		builder.WriteString(err.Error())
 	}
@@ -343,7 +366,11 @@ func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) e
 	traverse = func(seen Set[K], currentSeen Set[K], order []K, next K) error {
 		if currentSeen.Contains(next) {
 			order = append(order, next)
-			return CycleError[K]{Cycle: order}
+			descs := make([]string, len(order))
+			for ix, k := range order {
+				descs[ix] = getDescription(effectiveDAG.Nodes[k])
+			}
+			return CycleError[K]{Cycle: order, CycleDescriptions: descs}
 		}
 		seen.Add(next)
 		currentSeen.Add(next)
@@ -427,7 +454,7 @@ func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) e
 		for id := range waiting.Elems {
 			node := effectiveDAG.Nodes[id]
 			if !opts.Skip.IsZero() && opts.Skip.Contains(id) {
-				e.Log.V(10).Info("Node skipped by user, ignoring", "id", id)
+				e.Log.V(10).Info("Node skipped by user, ignoring", "id", id, "description", getDescription(node))
 				continue nodes
 			}
 			if !opts.StopAt.IsZero() && opts.StopAt.Contains(id) {
@@ -436,7 +463,7 @@ func (e Executor[K, E]) Run(ctx context.Context, d DAG[K, E], opts Options[K]) e
 			}
 			for dependency := range node.GetDependencies().Elems {
 				if !finished.Contains(dependency) {
-					e.Log.V(10).Info("Node has unfinished dependency, ignoring", "id", id, "dep", dependency)
+					e.Log.V(10).Info("Node has unfinished dependency, ignoring", "id", id, "description", getDescription(node), "dep", dependency, "dep-description", getDescription(dependency))
 					continue nodes
 				}
 
@@ -541,13 +568,16 @@ events:
 
 	// Remove any StopAt sentinel errors, since those shouldn't be reported to the caller.
 	// If that node actually failed, it will have been overwritten
+	failedDescs := make(map[K]string, len(failed))
 	for id, err := range failed {
 		if err == errStopAt {
 			delete(failed, id)
+			continue
 		}
+		failedDescs[id] = getDescription(effectiveDAG.Nodes[id])
 	}
 	if len(failed) != 0 {
-		return &RunError[K]{Errors: failed}
+		return &RunError[K]{Errors: failed, Descriptions: failedDescs}
 	}
 
 	return nil
